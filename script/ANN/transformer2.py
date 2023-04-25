@@ -3,7 +3,12 @@ import pandas as pd
 import torch
 from torch import nn
 from d2l import torch as d2l
+import os, sys
+
+os.chdir(sys.path[0])
+sys.path.append(sys.path[0] + "/../../")
 import MyTemplate.utils
+
 
 
 class PositionWiseFFN(nn.Module):
@@ -55,7 +60,108 @@ class PositionalEncoding(nn.Module):
         print(res.shape)
 
 
+def masked_softmax(X, valid_lens):
+    """Perform softmax operation by masking elements on the last axis.
 
+    Defined in :numref:`sec_attention-scoring-functions`"""
+    # `X`: 3D tensor, `valid_lens`: 1D or 2D tensor
+    if valid_lens is None:
+        return nn.functional.softmax(X, dim=-1)
+    else:
+        shape = X.shape
+        if valid_lens.dim() == 1:
+            valid_lens = torch.repeat_interleave(valid_lens, shape[1])
+        else:
+            valid_lens = valid_lens.reshape(-1)
+        # On the last axis, replace masked elements with a very large negative
+        # value, whose exponentiation outputs 0
+        X = d2l.sequence_mask(X.reshape(-1, shape[-1]), valid_lens,
+                              value=-1e6)
+        return nn.functional.softmax(X.reshape(shape), dim=-1)
+
+def transpose_qkv(X, num_heads):
+    """Transposition for parallel computation of multiple attention heads.
+
+    Defined in :numref:`sec_multihead-attention`"""
+    # Shape of input `X`:
+    # (`batch_size`, no. of queries or key-value pairs, `num_hiddens`).
+    # Shape of output `X`:
+    # (`batch_size`, no. of queries or key-value pairs, `num_heads`,
+    # `num_hiddens` / `num_heads`)
+    X = X.reshape(X.shape[0], X.shape[1], num_heads, -1)
+
+    # Shape of output `X`:
+    # (`batch_size`, `num_heads`, no. of queries or key-value pairs,
+    # `num_hiddens` / `num_heads`)
+    X = X.permute(0, 2, 1, 3)
+
+    # Shape of `output`:
+    # (`batch_size` * `num_heads`, no. of queries or key-value pairs,
+    # `num_hiddens` / `num_heads`)
+    return X.reshape(-1, X.shape[2], X.shape[3])
+
+
+
+class DotProductAttention(nn.Module):
+    """Scaled dot product attention.
+
+    Defined in :numref:`subsec_additive-attention`"""
+    def __init__(self, dropout, **kwargs):
+        super(DotProductAttention, self).__init__(**kwargs)
+        self.dropout = nn.Dropout(dropout)
+
+    # Shape of `queries`: (`batch_size`, no. of queries, `d`)
+    # Shape of `keys`: (`batch_size`, no. of key-value pairs, `d`)
+    # Shape of `values`: (`batch_size`, no. of key-value pairs, value
+    # dimension)
+    # Shape of `valid_lens`: (`batch_size`,) or (`batch_size`, no. of queries)
+    def forward(self, queries, keys, values, valid_lens=None):
+        d = queries.shape[-1]
+        # Set `transpose_b=True` to swap the last two dimensions of `keys`
+        scores = torch.bmm(queries, keys.transpose(1,2)) / math.sqrt(d)
+        self.attention_weights = masked_softmax(scores, valid_lens)
+        return torch.bmm(self.dropout(self.attention_weights), values)
+
+class MultiHeadAttention(nn.Module):
+    """Multi-head attention.
+
+    Defined in :numref:`sec_multihead-attention`"""
+    def __init__(self, key_size, query_size, value_size, num_hiddens,
+                 num_heads, dropout, bias=False, **kwargs):
+        super(MultiHeadAttention, self).__init__(**kwargs)
+        self.num_heads = num_heads
+        self.attention = d2l.DotProductAttention(dropout)
+        self.W_q = nn.Linear(query_size, num_hiddens, bias=bias)
+        self.W_k = nn.Linear(key_size, num_hiddens, bias=bias)
+        self.W_v = nn.Linear(value_size, num_hiddens, bias=bias)
+        self.W_o = nn.Linear(num_hiddens, num_hiddens, bias=bias)
+
+    def forward(self, queries, keys, values, valid_lens):
+        # Shape of `queries`, `keys`, or `values`:
+        # (`batch_size`, no. of queries or key-value pairs, `num_hiddens`)
+        # Shape of `valid_lens`:
+        # (`batch_size`,) or (`batch_size`, no. of queries)
+        # After transposing, shape of output `queries`, `keys`, or `values`:
+        # (`batch_size` * `num_heads`, no. of queries or key-value pairs,
+        # `num_hiddens` / `num_heads`)
+        queries = transpose_qkv(self.W_q(queries), self.num_heads)
+        keys = transpose_qkv(self.W_k(keys), self.num_heads)
+        values = transpose_qkv(self.W_v(values), self.num_heads)
+
+        if valid_lens is not None:
+            # On axis 0, copy the first item (scalar or vector) for
+            # `num_heads` times, then copy the next item, and so on
+            valid_lens = torch.repeat_interleave(
+                valid_lens, repeats=self.num_heads, dim=0)
+
+        # Shape of `output`: (`batch_size` * `num_heads`, no. of queries,
+        # `num_hiddens` / `num_heads`)
+        output = self.attention(queries, keys, values, valid_lens)
+
+        # Shape of `output_concat`:
+        # (`batch_size`, no. of queries, `num_hiddens`)
+        output_concat = transpose_output(output, self.num_heads)
+        return self.W_o(output_concat)
 
 class AddNorm(nn.Module):
     """残差连接后进行层规范化"""
@@ -100,7 +206,7 @@ class EncoderBlock(nn.Module):
                  norm_shape, ffn_num_input, ffn_num_hiddens, num_heads,
                  dropout, use_bias=False, **kwargs):
         super(EncoderBlock, self).__init__(**kwargs)
-        self.attention = d2l.MultiHeadAttention(
+        self.attention = MultiHeadAttention(
             key_size, query_size, value_size, num_hiddens, num_heads, dropout,
             use_bias)
         self.addnorm1 = AddNorm(norm_shape, dropout)
@@ -126,12 +232,12 @@ class EncoderBlock(nn.Module):
 
 
 #@save
-class TransformerEncoder(d2l.Encoder):
+class TransformerEncoder(nn.Module):
     """transformer编码器"""
     def __init__(self, vocab_size, key_size, query_size, value_size,
                  num_hiddens, norm_shape, ffn_num_input, ffn_num_hiddens,
                  num_heads, num_layers, dropout, use_bias=False, **kwargs):
-        super(TransformerEncoder, self).__init__(**kwargs)
+        super().__init__()
         self.num_hiddens = num_hiddens
         self.embedding = nn.Embedding(vocab_size, num_hiddens)
         self.pos_encoding = PositionalEncoding(num_hiddens, dropout)
@@ -142,7 +248,7 @@ class TransformerEncoder(d2l.Encoder):
                              norm_shape, ffn_num_input, ffn_num_hiddens,
                              num_heads, dropout, use_bias))
 
-    def forward(self, X, valid_lens, *args):
+    def forward(self, X, valid_lens, ):
         """
         X: 句子，shape=(句子数, 单词数)
         valid_lens：有效句子长度(其他位置变为0), shape=(句子数)
@@ -175,10 +281,10 @@ class DecoderBlock(nn.Module):
                  dropout, i, **kwargs):
         super(DecoderBlock, self).__init__(**kwargs)
         self.i = i
-        self.attention1 = d2l.MultiHeadAttention(
+        self.attention1 = MultiHeadAttention(
             key_size, query_size, value_size, num_hiddens, num_heads, dropout)
         self.addnorm1 = AddNorm(norm_shape, dropout)
-        self.attention2 = d2l.MultiHeadAttention(
+        self.attention2 = MultiHeadAttention(
             key_size, query_size, value_size, num_hiddens, num_heads, dropout)
         self.addnorm2 = AddNorm(norm_shape, dropout)
         self.ffn = PositionWiseFFN(ffn_num_input, ffn_num_hiddens,
@@ -216,15 +322,15 @@ class DecoderBlock(nn.Module):
 
 
 
-class TransformerDecoder(d2l.AttentionDecoder):
+class TransformerDecoder(nn.Module):
     def __init__(self, vocab_size, key_size, query_size, value_size,
                  num_hiddens, norm_shape, ffn_num_input, ffn_num_hiddens,
-                 num_heads, num_layers, dropout, **kwargs):
-        super(TransformerDecoder, self).__init__(**kwargs)
+                 num_heads, num_layers, dropout):
+        super().__init__()
         self.num_hiddens = num_hiddens
         self.num_layers = num_layers
         self.embedding = nn.Embedding(vocab_size, num_hiddens)
-        self.pos_encoding = d2l.PositionalEncoding(num_hiddens, dropout)
+        self.pos_encoding = PositionalEncoding(num_hiddens, dropout)
         self.blks = nn.Sequential()
         for i in range(num_layers):
             self.blks.add_module("block"+str(i),
